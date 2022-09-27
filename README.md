@@ -8,7 +8,7 @@ Architecturally, it is actually much simpler than DALL-E2. It consists of a casc
 
 It appears neither CLIP nor prior network is needed after all. And so research continues.
 
-<a href="https://www.youtube.com/watch?v=xqDeAz0U-R4">AI Coffee Break with Letitia</a> | <a href="https://www.assemblyai.com/blog/how-imagen-actually-works/">Assembly AI</a>
+<a href="https://www.youtube.com/watch?v=xqDeAz0U-R4">AI Coffee Break with Letitia</a> | <a href="https://www.assemblyai.com/blog/how-imagen-actually-works/">Assembly AI</a> | <a href="https://www.youtube.com/watch?v=af6WPqvzjjk">Yannic Kilcher</a>
 
 Please join <a href="https://discord.gg/xBPBXfcFHd"><img alt="Join us on Discord" src="https://img.shields.io/discord/823813159592001537?color=5865F2&logo=discord&logoColor=white"></a> if you are interested in helping out with the replication with the <a href="https://laion.ai/">LAION</a> community
 
@@ -19,6 +19,8 @@ Please join <a href="https://discord.gg/xBPBXfcFHd"><img alt="Join us on Discord
 - <a href="https://huggingface.co/">🤗 Huggingface</a> for their amazing transformers library. The text encoder portion is pretty much taken care of because of them
 
 - <a href="https://github.com/sgugger">Sylvain</a> and <a href="https://github.com/muellerzr">Zachary</a> for the <a href="https://github.com/huggingface/accelerate">Accelerate</a> library, which this repository uses for distributed training
+
+- <a href="https://github.com/arogozhnikov">Alex</a> for <a href="https://github.com/arogozhnikov/einops">einops</a>, indispensable tool for tensor manipulation
 
 - <a href="https://github.com/jorgemcgomes">Jorge Gomes</a> for helping out with the T5 loading code and advice on the correct T5 version
 
@@ -243,6 +245,62 @@ trainer.update(unet_number = 1)
 images = trainer.sample(batch_size = 16) # (16, 3, 128, 128)
 ```
 
+Or train only super-resoluting unets
+
+```python
+import torch
+from imagen_pytorch import Unet, NullUnet, Imagen
+
+# unet for imagen
+
+unet1 = NullUnet()  # add a placeholder "null" unet for the base unet
+
+unet2 = Unet(
+    dim = 32,
+    cond_dim = 512,
+    dim_mults = (1, 2, 4, 8),
+    num_resnet_blocks = (2, 4, 8, 8),
+    layer_attns = (False, False, False, True),
+    layer_cross_attns = (False, False, False, True)
+)
+
+# imagen, which contains the unets above (base unet and super resoluting ones)
+
+imagen = Imagen(
+    unets = (unet1, unet2),
+    image_sizes = (64, 256),
+    timesteps = 250,
+    cond_drop_prob = 0.1
+).cuda()
+
+# mock images (get a lot of this) and text encodings from large T5
+
+text_embeds = torch.randn(4, 256, 768).cuda()
+images = torch.randn(4, 3, 256, 256).cuda()
+
+# feed images into imagen, training each unet in the cascade
+
+loss = imagen(images, text_embeds = text_embeds, unet_number = 2)
+loss.backward()
+
+# do the above for many many many many steps
+# now you can sample an image based on the text embeddings as well as low resolution images
+
+lowres_images = torch.randn(3, 3, 64, 64).cuda()  # starting un-resoluted images
+
+images = imagen.sample(
+    texts = [
+        'a whale breaching from afar',
+        'young girl blowing out candles on her birthday cake',
+        'fireworks with blue and green sparkles'
+    ],
+    start_at_unet_number = 2,              # start at unet number 2
+    start_image_or_video = lowres_images,  # pass in low resolution images to be resoluted
+    cond_scale = 3.)
+
+images.shape # (3, 3, 256, 256)
+```
+
 At any time you can save and load the trainer and all associated states with the `save` and `load` methods. It is recommended you use these methods instead of manually saving with a `state_dict` call, as there are some device memory management being done underneath the hood within the trainer.
 
 ex.
@@ -400,7 +458,7 @@ inpainted_images = trainer.sample(texts = [
     'a whale breaching from afar',
     'young girl blowing out candles on her birthday cake',
     'fireworks with blue and green sparkles',
-    'fireworks with blue and green sparkles'
+    'dust motes swirling in the morning sunshine on the windowsill'
 ], inpaint_images = inpaint_images, inpaint_masks = inpaint_masks, cond_scale = 5.)
 
 inpainted_images # (4, 3, 512, 512)
@@ -440,6 +498,64 @@ imagen = ElucidatedImagen(
 
 ```
 
+## Text to Video (ongoing research)
+
+This repository will also start accumulating new research around text guided video synthesis. For starters it will adopt the 3d unet architecture described by Jonathan Ho in <a href="https://arxiv.org/abs/2204.03458">Video Diffusion Models</a>
+
+Ex.
+
+```python
+import torch
+from imagen_pytorch import Unet3D, ElucidatedImagen, ImagenTrainer
+
+unet1 = Unet3D(dim = 64, dim_mults = (1, 2, 4, 8)).cuda()
+
+unet2 = Unet3D(dim = 64, dim_mults = (1, 2, 4, 8)).cuda()
+
+# elucidated imagen, which contains the unets above (base unet and super resoluting ones)
+
+imagen = ElucidatedImagen(
+    unets = (unet1, unet2),
+    image_sizes = (16, 32),
+    random_crop_sizes = (None, 16),
+    num_sample_steps = 10,
+    cond_drop_prob = 0.1,
+    sigma_min = 0.002,                          # min noise level
+    sigma_max = (80, 160),                      # max noise level, double the max noise level for upsampler
+    sigma_data = 0.5,                           # standard deviation of data distribution
+    rho = 7,                                    # controls the sampling schedule
+    P_mean = -1.2,                              # mean of log-normal distribution from which noise is drawn for training
+    P_std = 1.2,                                # standard deviation of log-normal distribution from which noise is drawn for training
+    S_churn = 80,                               # parameters for stochastic sampling - depends on dataset, Table 5 in apper
+    S_tmin = 0.05,
+    S_tmax = 50,
+    S_noise = 1.003,
+).cuda()
+
+# mock videos (get a lot of this) and text encodings from large T5
+
+texts = [
+    'a whale breaching from afar',
+    'young girl blowing out candles on her birthday cake',
+    'fireworks with blue and green sparkles',
+    'dust motes swirling in the morning sunshine on the windowsill'
+]
+
+videos = torch.randn(4, 3, 10, 32, 32).cuda() # (batch, channels, time / video frames, height, width)
+
+# feed images into imagen, training each unet in the cascade
+# for this example, only training unet 1
+
+trainer = ImagenTrainer(imagen)
+trainer(videos, texts = texts, unet_number = 1)
+trainer.update(unet_number = 1)
+
+videos = trainer.sample(texts = texts, video_frames = 20) # extrapolating to 20 frames from training on 10 frames
+
+videos.shape # (4, 3, 20, 32, 32)
+
+```
+
 ## FAQ
 
 - Why are my generated images not aligning well with the text?
@@ -462,9 +578,15 @@ Not at the moment but one will likely be trained and open sourced within the yea
 
 More the reason why you should start training your own model, starting today! The last thing we need is this technology being in the hands of an elite few. Hopefully this repository reduces the work to just finding the necessary compute, and augmenting with your own curated dataset.
 
+- What am I allowed to do with this repository?
+
+Anything! It is MIT licensed. In other words, you can freely copy / paste for your own research, remixed for whatever modality you can think of. Go train amazing models for profit, for science, or simply to satiate your own personal pleasure at witnessing something divine unravel in front of you.
+
 ## Related Works
 
 - <a href="https://github.com/archinetai/audio-diffusion-pytorch">Audio diffusion</a> from <a href="https://github.com/flavioschneider">Flavio Schneider</a>
+
+- <a href="https://github.com/AssemblyAI-Examples/MinImagen">Mini Imagen</a> from <a href="https://github.com/oconnoob">Ryan O.</a> | <a href="https://www.assemblyai.com/blog/build-your-own-imagen-text-to-image-model/">AssemblyAI writeup</a>
 
 ## Todo
 
@@ -498,12 +620,34 @@ More the reason why you should start training your own model, starting today! Th
 - [x] build a simple checkpointing system, backed by a folder
 - [x] add skip connection from outputs of all upsample blocks, used in unet squared paper and some previous unet works
 - [x] add fsspec, recommended by Romain @rom1504, for cloud / local file system agnostic persistence of checkpoints
-- [ ] test out persistence in gcs with https://github.com/fsspec/gcsfs
+- [x] test out persistence in gcs with https://github.com/fsspec/gcsfs
+- [x] extend to video generation, using axial time attention as in Ho's video ddpm paper
+- [x] allow elucidated imagen to generalize to any shape
+- [x] allow for imagen to generalize to any shape
+- [x] add <a href="https://github.com/lucidrains/x-transformers#dynamic-positional-bias">dynamic positional bias</a> for the best type of length extrapolation across video time
+- [x] move video frames to sample function, as we will be attempting time extrapolation
+- [x] attention bias to null key / values should be a learned scalar of head dimension
+- [x] add self-conditioning from <a href="https://arxiv.org/abs/2208.04202">bit diffusion</a> paper, already coded up at <a href="https://github.com/lucidrains/denoising-diffusion-pytorch/commit/beb2f2d8dd9b4f2bd5be4719f37082fe061ee450">ddpm-pytorch</a>
+- [ ] reread <a href="https://arxiv.org/abs/2205.15868">cogvideo</a> and figure out how frame rate conditioning could be used
+- [ ] bring in attention expertise for self attention layers in unet3d
+- [ ] consider bringing in NUWA's 3d convolutional attention
+- [ ] consider transformer-xl memories in the temporal attention blocks
+- [ ] consider <a href="github.com/lucidrains/perceiver-ar-pytorch">perceiver-ar approach</a> to attending to past time
+- [ ] frame dropouts during attention for achieving both regularizing effect as well as shortened training time
+- [ ] investigate frank wood's claims https://github.com/lucidrains/flexible-diffusion-modeling-videos-pytorch and either add the hierarchical sampling technique, or let people know about its deficiencies
+- [ ] make sure inpainting works with video
+- [ ] offer challenging moving mnist (with distractor objects) as a one-line trainable baseline for researchers to branch off of for text to video
 - [ ] build out CLI tool for training, resuming training off config file
 - [ ] preencoding of text to memmapped embeddings
-- [ ] extend to video generation, using axial time attention as in Ho's video ddpm paper + https://github.com/lucidrains/flexible-diffusion-modeling-videos-pytorch for up to 25 minute video
 - [ ] be able to create dataloader iterators based on the old epoch style, also configure shuffling etc
 - [ ] be able to also pass in arguments (instead of requiring forward to be all keyword args on model)
+- [ ] bring in reversible blocks from revnets for 3d unet, to lessen memory burden
+- [ ] add ability to only train super-resolution network
+- [ ] read <a href="https://arxiv.org/abs/2206.00927v1">dpm-solver</a> see if it is applicable to continuous time gaussian diffusion
+- [ ] allow for conditioning video frames with arbitrary absolute times (calculate RPE during temporal attention)
+- [ ] accommodate <a href="https://dreambooth.github.io/">dream booth</a> fine tuning
+- [ ] add textual inversion
+- [ ] cleanup self conditioning to be extracted at imagen instantiation
 
 ## Citations
 
@@ -593,5 +737,47 @@ More the reason why you should start training your own model, starting today! Th
     journal = {ArXiv},
     year    = {2022},
     volume  = {abs/2201.09865}
+}
+```
+
+```bibtex
+@misc{ho2022video,
+    title   = {Video Diffusion Models},
+    author  = {Jonathan Ho and Tim Salimans and Alexey Gritsenko and William Chan and Mohammad Norouzi and David J. Fleet},
+    year    = {2022},
+    eprint  = {2204.03458},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CV}
+}
+```
+
+```bibtex
+@inproceedings{rogozhnikov2022einops,
+    title   = {Einops: Clear and Reliable Tensor Manipulations with Einstein-like Notation},
+    author  = {Alex Rogozhnikov},
+    booktitle = {International Conference on Learning Representations},
+    year    = {2022},
+    url     = {https://openreview.net/forum?id=oapKSVM2bcj}
+}
+```
+
+```bibtex
+@misc{chen2022analog,
+    title   = {Analog Bits: Generating Discrete Data using Diffusion Models with Self-Conditioning},
+    author  = {Ting Chen and Ruixiang Zhang and Geoffrey Hinton},
+    year    = {2022},
+    eprint  = {2208.04202},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CV}
+}
+```
+
+```bibtex
+@article{Sunkara2022NoMS,
+    title   = {No More Strided Convolutions or Pooling: A New CNN Building Block for Low-Resolution Images and Small Objects},
+    author  = {Raja Sunkara and Tie Luo},
+    journal = {ArXiv},
+    year    = {2022},
+    volume  = {abs/2208.03641}
 }
 ```
